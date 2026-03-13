@@ -146,6 +146,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import androidx.fragment.app.DialogFragment;
 import com.pdftron.pdf.dialog.signature.SignatureDialogFragment;
 import com.pdftron.pdf.widget.preset.signature.SignatureSelectionDialog;
+import com.pdftron.pdf.widget.preset.component.view.PresetSingleButton;
 
 import static com.pdftron.reactnative.utils.Constants.*;
 
@@ -3033,6 +3034,18 @@ public class DocumentView extends com.pdftron.pdf.controls.DocumentView2 {
             params.putString(KEY_TOOL, newToolString != null ? newToolString : unknownString);
 
             onReceiveNativeEvent(params);
+
+            // When a new Signature tool is created (e.g. after placement via safeSetNextToolMode()),
+            // PresetBarComponent.setupAnnotProperty() resets mSignatureFilePath to its default preset.
+            // Clear it with a deferred post() so the SignatureSelectionDialog (with our 4 buttons)
+            // always appears on the next tap instead of auto-placing the PresetBarComponent's default.
+            if (newTool instanceof Signature) {
+                final Signature sig = (Signature) newTool;
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    sig.setSignatureFilePath("");
+                    Log.d(TAG, "toolChanged: cleared mSignatureFilePath on new Signature tool");
+                });
+            }
         }
     };
 
@@ -3557,20 +3570,19 @@ thread.start();
                     showImportFromBinaFab(f);
                 }
 
-                // Dismiss SignatureSelectionDialog (only shows 2 signatures) and show our custom dialog
+                // Inject additional signature buttons into the native SignatureSelectionDialog
                 if (f instanceof SignatureSelectionDialog) {
-                    Log.d(TAG, "!!! SignatureSelectionDialog detected - DISMISSING and showing custom dialog");
-                    SignatureSelectionDialog selectionDialog = (SignatureSelectionDialog) f;
-                    selectionDialog.dismiss();
+                    Log.d(TAG, "SignatureSelectionDialog detected — will inject extra signature buttons");
+                    final SignatureSelectionDialog selDialog = (SignatureSelectionDialog) f;
 
-                    // Show our custom dialog with all 4 signatures
-                    new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                        ToolManager tm = getToolManager();
-                        if (tm != null && tm.getTool() instanceof Signature) {
-                            showCustomSignatureDialog((Signature) tm.getTool());
+                    // Use post() to run after the dialog's view is fully inflated
+                    selDialog.requireView().post(() -> {
+                        try {
+                            injectExtraSignatureButtons(selDialog);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to inject extra signature buttons", e);
                         }
-                    }, 100);
-                    return;
+                    });
                 }
 
                 // Set listener and hide create options in SignatureDialogFragment
@@ -5560,9 +5572,11 @@ thread.start();
         mSpeedDialView = speedDialView;
 
         // Check if already added
-        if (speedDialView.getActionItem(IMPORT_FROM_BINA_FAB_ID) != null) {
-            Log.d(TAG, "Import from Bina item already exists in SpeedDial");
-            return;
+        for (SpeedDialActionItem item : speedDialView.getActionItems()) {
+            if (item.getId() == IMPORT_FROM_BINA_FAB_ID) {
+                Log.d(TAG, "Import from Bina item already exists in SpeedDial");
+                return;
+            }
         }
 
         Context context = getContext();
@@ -5582,24 +5596,40 @@ thread.start();
         // Add to the SpeedDialView at position 0 (top of the expanded list)
         speedDialView.addActionItem(importFromBinaItem, 0);
 
-        // Get ThumbnailsViewFragment to use as the original handler
-        final ThumbnailsViewFragment tvf = (thumbnailsFragment instanceof ThumbnailsViewFragment)
-            ? (ThumbnailsViewFragment) thumbnailsFragment : null;
+        // Capture the original OnActionSelectedListener via reflection before we overwrite it.
+        // ThumbnailsViewFragment sets its own listener for add-page/insert-document actions,
+        // and setOnActionSelectedListener replaces it — returning false does NOT re-invoke it.
+        try {
+            java.lang.reflect.Field listenerField = SpeedDialView.class.getDeclaredField("mOnActionSelectedListener");
+            listenerField.setAccessible(true);
+            final SpeedDialView.OnActionSelectedListener originalListener =
+                    (SpeedDialView.OnActionSelectedListener) listenerField.get(speedDialView);
 
-        // Set up click listener that handles our item and delegates others
-        speedDialView.setOnActionSelectedListener(actionItem -> {
-            if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
-                Log.d(TAG, "Import from Bina clicked!");
-                emitImportFromBinaPressed();
-                speedDialView.close();
-                return true;
-            }
-            // For other items, let ThumbnailsViewFragment handle them
-            if (tvf != null) {
-                return tvf.onActionSelected(actionItem);
-            }
-            return false;
-        });
+            speedDialView.setOnActionSelectedListener(actionItem -> {
+                if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
+                    Log.d(TAG, "Import from Bina clicked!");
+                    emitImportFromBinaPressed();
+                    speedDialView.close();
+                    return true;
+                }
+                // Delegate to the original listener (ThumbnailsViewFragment's handler)
+                if (originalListener != null) {
+                    return originalListener.onActionSelected(actionItem);
+                }
+                return false;
+            });
+        } catch (Exception e) {
+            Log.w(TAG, "Could not capture original SpeedDial listener, falling back", e);
+            speedDialView.setOnActionSelectedListener(actionItem -> {
+                if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
+                    Log.d(TAG, "Import from Bina clicked!");
+                    emitImportFromBinaPressed();
+                    speedDialView.close();
+                    return true;
+                }
+                return false;
+            });
+        }
 
         Log.d(TAG, "Import from Bina item added to SpeedDialView successfully");
     }
@@ -5851,6 +5881,347 @@ thread.start();
                 hideSignatureCreateButton(viewGroup.getChildAt(i));
             }
         }
+    }
+
+    // Ensure the Signature tool has a valid mTargetPoint and mTargetPageNum.
+    // addSignatureStamp() accesses mTargetPoint.x/.y WITHOUT null check — NPE is silently caught,
+    // resulting in "no signature appears". This happens when the SignatureSelectionDialog is shown
+    // by the toolbar's PresetBarComponent (no document tap set mTargetPoint).
+    private void ensureSignatureTargetPoint(Signature sig) {
+        try {
+            java.lang.reflect.Field targetPointField = sig.getClass().getDeclaredField("mTargetPoint");
+            targetPointField.setAccessible(true);
+            android.graphics.PointF targetPoint = (android.graphics.PointF) targetPointField.get(sig);
+
+            java.lang.reflect.Field targetPageField = sig.getClass().getDeclaredField("mTargetPageNum");
+            targetPageField.setAccessible(true);
+            int targetPage = targetPageField.getInt(sig);
+
+            Log.d(TAG, "ensureSignatureTargetPoint: mTargetPoint=" + targetPoint
+                    + " mTargetPageNum=" + targetPage);
+
+            if (targetPoint == null || targetPage <= 0) {
+                // mTargetPoint not set — compute center of current visible page
+                PDFViewCtrl pdfViewCtrl = getPdfViewCtrl();
+                if (pdfViewCtrl != null) {
+                    int currentPage = pdfViewCtrl.getCurrentPage();
+                    if (currentPage <= 0) currentPage = 1;
+
+                    // Get the center of the visible area in screen coords, convert to page coords
+                    int viewWidth = pdfViewCtrl.getWidth();
+                    int viewHeight = pdfViewCtrl.getHeight();
+                    double screenX = viewWidth / 2.0;
+                    double screenY = viewHeight / 2.0;
+                    double[] pagePoint = pdfViewCtrl.convScreenPtToPagePt(screenX, screenY, currentPage);
+
+                    android.graphics.PointF newTarget = new android.graphics.PointF(
+                            (float) pagePoint[0], (float) pagePoint[1]);
+
+                    // Set via public API if available, otherwise via reflection
+                    sig.setTargetPoint(newTarget, currentPage);
+
+                    Log.d(TAG, "ensureSignatureTargetPoint: SET mTargetPoint=" + newTarget
+                            + " mTargetPageNum=" + currentPage
+                            + " (center of visible area)");
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "ensureSignatureTargetPoint: failed", e);
+        }
+    }
+
+    // Override ALL signature buttons in SignatureSelectionDialog with our own consistent ordering.
+    // Native dialog only creates mFirstSignature/mSecondSignature — we override those AND inject
+    // new buttons for index 2+, so all buttons use the same logic and ordering.
+    private void injectExtraSignatureButtons(SignatureSelectionDialog selDialog) {
+        Context context = getContext();
+        if (context == null) {
+            Log.e(TAG, "injectExtraSignatureButtons: context is null");
+            return;
+        }
+
+        // Step 1: Access private fields via reflection
+        Log.d(TAG, "injectExtraSignatureButtons: accessing fields via reflection");
+        PresetSingleButton firstSig = null;
+        PresetSingleButton secondSig = null;
+        android.widget.TextView additionalSig = null;
+        try {
+            java.lang.reflect.Field fFirst = SignatureSelectionDialog.class.getDeclaredField("mFirstSignature");
+            fFirst.setAccessible(true);
+            firstSig = (PresetSingleButton) fFirst.get(selDialog);
+            Log.d(TAG, "injectExtraSignatureButtons: got mFirstSignature = " + firstSig);
+
+            java.lang.reflect.Field fSecond = SignatureSelectionDialog.class.getDeclaredField("mSecondSignature");
+            fSecond.setAccessible(true);
+            secondSig = (PresetSingleButton) fSecond.get(selDialog);
+            Log.d(TAG, "injectExtraSignatureButtons: got mSecondSignature = " + secondSig);
+
+            java.lang.reflect.Field fAdditional = SignatureSelectionDialog.class.getDeclaredField("mAdditionalSignature");
+            fAdditional.setAccessible(true);
+            additionalSig = (android.widget.TextView) fAdditional.get(selDialog);
+            Log.d(TAG, "injectExtraSignatureButtons: got mAdditionalSignature = " + additionalSig);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            Log.e(TAG, "injectExtraSignatureButtons: reflection failed", e);
+            return;
+        }
+
+        if (firstSig == null || secondSig == null) {
+            Log.e(TAG, "injectExtraSignatureButtons: firstSig or secondSig is null");
+            return;
+        }
+
+        // Step 2: Find the parent ViewGroup
+        ViewGroup parent = (ViewGroup) secondSig.getParent();
+        if (parent == null) {
+            Log.e(TAG, "injectExtraSignatureButtons: parent ViewGroup is null");
+            return;
+        }
+        Log.d(TAG, "injectExtraSignatureButtons: parent = " + parent.getClass().getSimpleName()
+                + " with " + parent.getChildCount() + " children");
+
+        // Step 3: Get all saved signature files
+        File sigDir = StampManager.getInstance().getSavedSignatureFolder(context);
+        File jpgDir = StampManager.getInstance().getSavedSignatureJpgFolder(context);
+        Log.d(TAG, "injectExtraSignatureButtons: sigDir=" + sigDir.getAbsolutePath()
+                + " jpgDir=" + jpgDir.getAbsolutePath());
+
+        if (!jpgDir.exists() || !jpgDir.isDirectory()) {
+            Log.d(TAG, "injectExtraSignatureButtons: jpgDir does not exist");
+            return;
+        }
+
+        File[] jpgFiles = jpgDir.listFiles((dir, name) -> name.endsWith(".jpg"));
+        if (jpgFiles == null || jpgFiles.length == 0) {
+            Log.d(TAG, "injectExtraSignatureButtons: no JPG files found");
+            return;
+        }
+
+        // Sort for consistent ordering (matches creation order from mSignatureArrayUrl)
+        java.util.Arrays.sort(jpgFiles, (a, b) -> a.getName().compareTo(b.getName()));
+        Log.d(TAG, "injectExtraSignatureButtons: found " + jpgFiles.length + " total signatures");
+
+        // Build parallel lists: JPG files (for preview display) and PDF files (for click handlers)
+        // PresetSingleButton.setPresetFile() uses Picasso/BitmapFactory internally — only JPG/PNG works
+        List<File> matchedJpgFiles = new ArrayList<>();
+        List<File> pdfFiles = new ArrayList<>();
+        for (File jpgFile : jpgFiles) {
+            String jpgName = jpgFile.getName();
+            String pdfName = jpgName.substring(0, jpgName.length() - 4); // strip .jpg
+            File pdfFile = new File(sigDir, pdfName);
+            if (pdfFile.exists()) {
+                matchedJpgFiles.add(jpgFile);
+                pdfFiles.add(pdfFile);
+                Log.d(TAG, "injectExtraSignatureButtons: mapped " + jpgName + " -> " + pdfFile.getName());
+            } else {
+                Log.w(TAG, "injectExtraSignatureButtons: PDF not found for " + jpgName);
+            }
+        }
+
+        if (pdfFiles.isEmpty()) {
+            Log.d(TAG, "injectExtraSignatureButtons: no valid PDF files found");
+            return;
+        }
+
+        // Step 4: Get setButtonTheme method via reflection (used for all buttons)
+        java.lang.reflect.Method setThemeMethod = null;
+        try {
+            setThemeMethod = SignatureSelectionDialog.class.getDeclaredMethod(
+                    "setButtonTheme", PresetSingleButton.class);
+            setThemeMethod.setAccessible(true);
+        } catch (NoSuchMethodException e) {
+            Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme method not found", e);
+        }
+
+        // Step 5: Set dialog's internal signature paths to match our ordering
+        // This ensures the dialog's internal state is consistent with our button layout
+        List<String> orderedPaths = new ArrayList<>();
+        for (File f : pdfFiles) {
+            orderedPaths.add(f.getAbsolutePath());
+        }
+        selDialog.setSignatures(orderedPaths);
+        Log.d(TAG, "injectExtraSignatureButtons: called setSignatures with " + orderedPaths.size() + " paths");
+
+        // Step 6: Override native buttons (index 0-1) with our consistent ordering
+        // Native setSignatures() may use a different order — we override to match mSignatureArrayUrl order
+        PresetSingleButton[] nativeButtons = { firstSig, secondSig };
+        for (int i = 0; i < Math.min(2, pdfFiles.size()); i++) {
+            File pdfFile = pdfFiles.get(i);
+            File jpgFile = matchedJpgFiles.get(i);
+            PresetSingleButton button = nativeButtons[i];
+
+            // Apply theme first (resets to empty state)
+            if (setThemeMethod != null) {
+                try {
+                    setThemeMethod.invoke(selDialog, button);
+                } catch (Exception e) {
+                    Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme failed for native button " + i, e);
+                }
+            }
+
+            // Cancel pending Picasso loads from native setSignatures() on BOTH internal ImageViews
+            // PresetSingleButton uses mPresetIcon OR mPresetIconWithBackground depending on theme
+            try {
+                java.lang.reflect.Field iconField = PresetSingleButton.class.getDeclaredField("mPresetIcon");
+                iconField.setAccessible(true);
+                android.widget.ImageView iconView = (android.widget.ImageView) iconField.get(button);
+                com.squareup.picasso.Picasso.get().cancelRequest(iconView);
+
+                java.lang.reflect.Field iconBgField = PresetSingleButton.class.getDeclaredField("mPresetIconWithBackground");
+                iconBgField.setAccessible(true);
+                android.widget.ImageView iconBgView = (android.widget.ImageView) iconBgField.get(button);
+                com.squareup.picasso.Picasso.get().cancelRequest(iconBgView);
+
+                Log.d(TAG, "injectExtraSignatureButtons: cancelled Picasso for native button " + i);
+            } catch (Exception e) {
+                Log.w(TAG, "injectExtraSignatureButtons: failed to cancel Picasso for native button " + i, e);
+            }
+
+            // Decode JPG and set bitmap directly — bypasses PDFTron's broken Skia decoder
+            Bitmap previewBitmap = BitmapFactory.decodeFile(jpgFile.getAbsolutePath());
+            if (previewBitmap != null) {
+                button.setPresetBitmap(previewBitmap);
+                Log.d(TAG, "injectExtraSignatureButtons: loaded bitmap " + previewBitmap.getWidth()
+                        + "x" + previewBitmap.getHeight() + " for native button " + i);
+            } else {
+                Log.w(TAG, "injectExtraSignatureButtons: failed to decode JPG for native button " + i
+                        + ": " + jpgFile.getAbsolutePath());
+            }
+
+            // Set click listener: dismiss dialog, set signature file, let user tap to place
+            // This mirrors the original PR #4 flow: dismiss → sigTool.create(path, null) →
+            // tool stays in Signature mode → user taps document → stamp placed at tap point
+            final String pdfPath = pdfFile.getAbsolutePath();
+            button.setOnClickListener(v -> {
+                Log.d(TAG, "injectExtraSignatureButtons: native sig clicked: " + pdfPath);
+                selDialog.dismiss();
+                ToolManager tm2 = getToolManager();
+                if (tm2 != null && tm2.getTool() instanceof Signature) {
+                    Signature sig = (Signature) tm2.getTool();
+                    sig.setSignatureFilePath(pdfPath);
+                    Log.d(TAG, "injectExtraSignatureButtons: signature file set, waiting for tap to place");
+                } else {
+                    Log.w(TAG, "injectExtraSignatureButtons: tool is not Signature at click time");
+                }
+            });
+
+            Log.d(TAG, "injectExtraSignatureButtons: overrode native button " + i
+                    + " with " + pdfFile.getName());
+        }
+
+        // Step 7: Inject new buttons for index 2+ (no native buttons exist for these)
+        if (pdfFiles.size() <= 2) {
+            Log.d(TAG, "injectExtraSignatureButtons: only " + pdfFiles.size()
+                    + " signatures — no extra buttons needed");
+            return;
+        }
+
+        if (!(parent instanceof androidx.constraintlayout.widget.ConstraintLayout)) {
+            Log.e(TAG, "injectExtraSignatureButtons: parent is not ConstraintLayout, it's " + parent.getClass().getName());
+            return;
+        }
+        androidx.constraintlayout.widget.ConstraintLayout constraintParent =
+                (androidx.constraintlayout.widget.ConstraintLayout) parent;
+
+        int previousViewId = secondSig.getId();
+        float density = context.getResources().getDisplayMetrics().density;
+        int height46dp = (int) (46 * density);
+        int margin16dp = (int) (16 * density);
+        int margin4dp = (int) (4 * density);
+
+        int added = 0;
+        List<Integer> newButtonIds = new ArrayList<>();
+        for (int i = 2; i < pdfFiles.size(); i++) {
+            File pdfFile = pdfFiles.get(i);
+            File jpgFile = matchedJpgFiles.get(i);
+
+            // Create a new PresetSingleButton
+            PresetSingleButton newButton = new PresetSingleButton(context);
+            newButton.setId(View.generateViewId());
+
+            // 1. Apply theme FIRST (sets empty state + colors)
+            if (setThemeMethod != null) {
+                try {
+                    setThemeMethod.invoke(selDialog, newButton);
+                    Log.d(TAG, "injectExtraSignatureButtons: applied setButtonTheme to button " + i);
+                } catch (Exception themeEx) {
+                    Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme failed for button " + i, themeEx);
+                    newButton.setBackgroundColor(0);
+                }
+            }
+
+            // 2. Decode JPG and set bitmap directly — bypasses PDFTron's broken Skia decoder
+            Bitmap extraBitmap = BitmapFactory.decodeFile(jpgFile.getAbsolutePath());
+            if (extraBitmap != null) {
+                newButton.setPresetBitmap(extraBitmap);
+                Log.d(TAG, "injectExtraSignatureButtons: loaded bitmap " + extraBitmap.getWidth()
+                        + "x" + extraBitmap.getHeight() + " for extra button " + i);
+            } else {
+                Log.w(TAG, "injectExtraSignatureButtons: failed to decode JPG for extra button " + i
+                        + ": " + jpgFile.getAbsolutePath());
+            }
+            newButton.setArrowIconVisible(false);
+
+            // ConstraintLayout params matching native buttons: width=MATCH_CONSTRAINT, height=46dp
+            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams lp =
+                    new androidx.constraintlayout.widget.ConstraintLayout.LayoutParams(
+                            0, height46dp);
+            lp.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+            lp.endToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+            lp.topToBottom = previousViewId;
+            lp.setMargins(margin16dp, margin4dp, margin16dp, 0);
+            newButton.setLayoutParams(lp);
+
+            // Click listener: dismiss dialog, set signature file, let user tap to place
+            final String pdfPath = pdfFile.getAbsolutePath();
+            newButton.setOnClickListener(v -> {
+                Log.d(TAG, "injectExtraSignatureButtons: extra sig clicked: " + pdfPath);
+                selDialog.dismiss();
+                ToolManager tm2 = getToolManager();
+                if (tm2 != null && tm2.getTool() instanceof Signature) {
+                    Signature sig = (Signature) tm2.getTool();
+                    sig.setSignatureFilePath(pdfPath);
+                    Log.d(TAG, "injectExtraSignatureButtons: signature file set, waiting for tap to place");
+                } else {
+                    Log.w(TAG, "injectExtraSignatureButtons: tool is not Signature at click time");
+                }
+            });
+
+            constraintParent.addView(newButton);
+            newButtonIds.add(newButton.getId());
+            previousViewId = newButton.getId();
+            added++;
+            Log.d(TAG, "injectExtraSignatureButtons: added button " + i + " id=" + newButton.getId()
+                    + " file=" + pdfFile.getName());
+        }
+
+        // Step 8: Update the Barrier to include new buttons so Manage/Create shift down
+        if (added > 0) {
+            for (int c = 0; c < constraintParent.getChildCount(); c++) {
+                View child = constraintParent.getChildAt(c);
+                if (child instanceof androidx.constraintlayout.widget.Barrier) {
+                    androidx.constraintlayout.widget.Barrier barrier =
+                            (androidx.constraintlayout.widget.Barrier) child;
+                    int[] oldIds = barrier.getReferencedIds();
+                    int[] newIds = new int[oldIds.length + newButtonIds.size()];
+                    System.arraycopy(oldIds, 0, newIds, 0, oldIds.length);
+                    for (int n = 0; n < newButtonIds.size(); n++) {
+                        newIds[oldIds.length + n] = newButtonIds.get(n);
+                    }
+                    barrier.setReferencedIds(newIds);
+                    Log.d(TAG, "injectExtraSignatureButtons: updated barrier with "
+                            + newIds.length + " referenced IDs");
+                    break;
+                }
+            }
+        }
+
+        // Step 9: Hide the "+more" text since all signatures are now visible
+        if (additionalSig != null) {
+            additionalSig.setVisibility(View.GONE);
+            Log.d(TAG, "injectExtraSignatureButtons: hid mAdditionalSignature");
+        }
+
+        Log.d(TAG, "injectExtraSignatureButtons: done — overrode 2 native + injected " + added + " extra buttons");
     }
 
     // Custom signature selection dialog that shows all 4 preloaded signatures
