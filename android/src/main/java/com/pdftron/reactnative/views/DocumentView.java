@@ -147,7 +147,6 @@ import androidx.fragment.app.DialogFragment;
 import com.pdftron.pdf.dialog.signature.SignatureDialogFragment;
 import com.pdftron.pdf.widget.preset.signature.SignatureSelectionDialog;
 import com.pdftron.pdf.widget.preset.component.view.PresetSingleButton;
-
 import static com.pdftron.reactnative.utils.Constants.*;
 
 public class DocumentView extends com.pdftron.pdf.controls.DocumentView2 {
@@ -3010,7 +3009,6 @@ public class DocumentView extends com.pdftron.pdf.controls.DocumentView2 {
         }
     };
 
-    private boolean mShowingCustomSignatureDialog = false;
 
     private final ToolManager.ToolChangedListener mToolChangedListener = new ToolManager.ToolChangedListener() {
         @Override
@@ -3037,13 +3035,12 @@ public class DocumentView extends com.pdftron.pdf.controls.DocumentView2 {
 
             // When a new Signature tool is created (e.g. after placement via safeSetNextToolMode()),
             // PresetBarComponent.setupAnnotProperty() resets mSignatureFilePath to its default preset.
-            // Clear it with a deferred post() so the SignatureSelectionDialog (with our 4 buttons)
+            // Clear it with a deferred post() so the SignatureSelectionDialog (with our injected buttons)
             // always appears on the next tap instead of auto-placing the PresetBarComponent's default.
             if (newTool instanceof Signature) {
                 final Signature sig = (Signature) newTool;
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     sig.setSignatureFilePath("");
-                    Log.d(TAG, "toolChanged: cleared mSignatureFilePath on new Signature tool");
                 });
             }
         }
@@ -3572,7 +3569,6 @@ thread.start();
 
                 // Inject additional signature buttons into the native SignatureSelectionDialog
                 if (f instanceof SignatureSelectionDialog) {
-                    Log.d(TAG, "SignatureSelectionDialog detected — will inject extra signature buttons");
                     final SignatureSelectionDialog selDialog = (SignatureSelectionDialog) f;
 
                     // Use post() to run after the dialog's view is fully inflated
@@ -5574,7 +5570,6 @@ thread.start();
         // Check if already added
         for (SpeedDialActionItem item : speedDialView.getActionItems()) {
             if (item.getId() == IMPORT_FROM_BINA_FAB_ID) {
-                Log.d(TAG, "Import from Bina item already exists in SpeedDial");
                 return;
             }
         }
@@ -5593,45 +5588,38 @@ thread.start();
                 .setLabelBackgroundColor(androidx.core.content.ContextCompat.getColor(context, android.R.color.white))
                 .create();
 
-        // Add to the SpeedDialView at position 0 (top of the expanded list)
-        speedDialView.addActionItem(importFromBinaItem, 0);
-
         // Capture the original OnActionSelectedListener via reflection before we overwrite it.
         // ThumbnailsViewFragment sets its own listener for add-page/insert-document actions,
         // and setOnActionSelectedListener replaces it — returning false does NOT re-invoke it.
         try {
             java.lang.reflect.Field listenerField = SpeedDialView.class.getDeclaredField("mOnActionSelectedListener");
             listenerField.setAccessible(true);
-            final SpeedDialView.OnActionSelectedListener originalListener =
-                    (SpeedDialView.OnActionSelectedListener) listenerField.get(speedDialView);
-
-            speedDialView.setOnActionSelectedListener(actionItem -> {
-                if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
-                    Log.d(TAG, "Import from Bina clicked!");
-                    emitImportFromBinaPressed();
-                    speedDialView.close();
-                    return true;
-                }
-                // Delegate to the original listener (ThumbnailsViewFragment's handler)
-                if (originalListener != null) {
-                    return originalListener.onActionSelected(actionItem);
-                }
-                return false;
-            });
+            mOriginalSpeedDialListener = (SpeedDialView.OnActionSelectedListener) listenerField.get(speedDialView);
         } catch (Exception e) {
-            Log.w(TAG, "Could not capture original SpeedDial listener, falling back", e);
-            speedDialView.setOnActionSelectedListener(actionItem -> {
-                if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
-                    Log.d(TAG, "Import from Bina clicked!");
-                    emitImportFromBinaPressed();
-                    speedDialView.close();
-                    return true;
-                }
-                return false;
-            });
+            Log.e(TAG, "Could not capture original SpeedDial listener via reflection", e);
+            mOriginalSpeedDialListener = null;
         }
 
-        Log.d(TAG, "Import from Bina item added to SpeedDialView successfully");
+        // Add to the SpeedDialView at position 0 (top of the expanded list)
+        speedDialView.addActionItem(importFromBinaItem, 0);
+
+        // Keep a final reference for the lambda
+        final SpeedDialView.OnActionSelectedListener originalListener = mOriginalSpeedDialListener;
+
+        // Set up click listener that handles our item and delegates others
+        speedDialView.setOnActionSelectedListener(actionItem -> {
+            if (actionItem.getId() == IMPORT_FROM_BINA_FAB_ID) {
+                emitImportFromBinaPressed();
+                speedDialView.close();
+                return true;
+            }
+            // Delegate non-Bina actions to the original PDFTron listener
+            if (originalListener != null) {
+                return originalListener.onActionSelected(actionItem);
+            }
+            return false;
+        });
+
     }
 
     private void addFallbackImportFromBinaFab(View parentView) {
@@ -5677,7 +5665,7 @@ thread.start();
 
     private void hideImportFromBinaFab() {
         if (mSpeedDialView != null) {
-            mSpeedDialView.removeActionItem(IMPORT_FROM_BINA_FAB_ID);
+            mSpeedDialView.removeActionItemById(IMPORT_FROM_BINA_FAB_ID);
             mSpeedDialView = null;
             Log.d(TAG, "Import from Bina item removed from SpeedDial");
         }
@@ -5897,9 +5885,6 @@ thread.start();
             targetPageField.setAccessible(true);
             int targetPage = targetPageField.getInt(sig);
 
-            Log.d(TAG, "ensureSignatureTargetPoint: mTargetPoint=" + targetPoint
-                    + " mTargetPageNum=" + targetPage);
-
             if (targetPoint == null || targetPage <= 0) {
                 // mTargetPoint not set — compute center of current visible page
                 PDFViewCtrl pdfViewCtrl = getPdfViewCtrl();
@@ -5907,7 +5892,6 @@ thread.start();
                     int currentPage = pdfViewCtrl.getCurrentPage();
                     if (currentPage <= 0) currentPage = 1;
 
-                    // Get the center of the visible area in screen coords, convert to page coords
                     int viewWidth = pdfViewCtrl.getWidth();
                     int viewHeight = pdfViewCtrl.getHeight();
                     double screenX = viewWidth / 2.0;
@@ -5917,16 +5901,11 @@ thread.start();
                     android.graphics.PointF newTarget = new android.graphics.PointF(
                             (float) pagePoint[0], (float) pagePoint[1]);
 
-                    // Set via public API if available, otherwise via reflection
                     sig.setTargetPoint(newTarget, currentPage);
-
-                    Log.d(TAG, "ensureSignatureTargetPoint: SET mTargetPoint=" + newTarget
-                            + " mTargetPageNum=" + currentPage
-                            + " (center of visible area)");
                 }
             }
         } catch (Exception e) {
-            Log.w(TAG, "ensureSignatureTargetPoint: failed", e);
+            Log.e(TAG, "ensureSignatureTargetPoint: failed", e);
         }
     }
 
@@ -5941,7 +5920,6 @@ thread.start();
         }
 
         // Step 1: Access private fields via reflection
-        Log.d(TAG, "injectExtraSignatureButtons: accessing fields via reflection");
         PresetSingleButton firstSig = null;
         PresetSingleButton secondSig = null;
         android.widget.TextView additionalSig = null;
@@ -5949,17 +5927,14 @@ thread.start();
             java.lang.reflect.Field fFirst = SignatureSelectionDialog.class.getDeclaredField("mFirstSignature");
             fFirst.setAccessible(true);
             firstSig = (PresetSingleButton) fFirst.get(selDialog);
-            Log.d(TAG, "injectExtraSignatureButtons: got mFirstSignature = " + firstSig);
 
             java.lang.reflect.Field fSecond = SignatureSelectionDialog.class.getDeclaredField("mSecondSignature");
             fSecond.setAccessible(true);
             secondSig = (PresetSingleButton) fSecond.get(selDialog);
-            Log.d(TAG, "injectExtraSignatureButtons: got mSecondSignature = " + secondSig);
 
             java.lang.reflect.Field fAdditional = SignatureSelectionDialog.class.getDeclaredField("mAdditionalSignature");
             fAdditional.setAccessible(true);
             additionalSig = (android.widget.TextView) fAdditional.get(selDialog);
-            Log.d(TAG, "injectExtraSignatureButtons: got mAdditionalSignature = " + additionalSig);
         } catch (NoSuchFieldException | IllegalAccessException e) {
             Log.e(TAG, "injectExtraSignatureButtons: reflection failed", e);
             return;
@@ -5976,32 +5951,24 @@ thread.start();
             Log.e(TAG, "injectExtraSignatureButtons: parent ViewGroup is null");
             return;
         }
-        Log.d(TAG, "injectExtraSignatureButtons: parent = " + parent.getClass().getSimpleName()
-                + " with " + parent.getChildCount() + " children");
 
         // Step 3: Get all saved signature files
         File sigDir = StampManager.getInstance().getSavedSignatureFolder(context);
         File jpgDir = StampManager.getInstance().getSavedSignatureJpgFolder(context);
-        Log.d(TAG, "injectExtraSignatureButtons: sigDir=" + sigDir.getAbsolutePath()
-                + " jpgDir=" + jpgDir.getAbsolutePath());
 
         if (!jpgDir.exists() || !jpgDir.isDirectory()) {
-            Log.d(TAG, "injectExtraSignatureButtons: jpgDir does not exist");
             return;
         }
 
         File[] jpgFiles = jpgDir.listFiles((dir, name) -> name.endsWith(".jpg"));
         if (jpgFiles == null || jpgFiles.length == 0) {
-            Log.d(TAG, "injectExtraSignatureButtons: no JPG files found");
             return;
         }
 
         // Sort for consistent ordering (matches creation order from mSignatureArrayUrl)
         java.util.Arrays.sort(jpgFiles, (a, b) -> a.getName().compareTo(b.getName()));
-        Log.d(TAG, "injectExtraSignatureButtons: found " + jpgFiles.length + " total signatures");
 
         // Build parallel lists: JPG files (for preview display) and PDF files (for click handlers)
-        // PresetSingleButton.setPresetFile() uses Picasso/BitmapFactory internally — only JPG/PNG works
         List<File> matchedJpgFiles = new ArrayList<>();
         List<File> pdfFiles = new ArrayList<>();
         for (File jpgFile : jpgFiles) {
@@ -6011,14 +5978,10 @@ thread.start();
             if (pdfFile.exists()) {
                 matchedJpgFiles.add(jpgFile);
                 pdfFiles.add(pdfFile);
-                Log.d(TAG, "injectExtraSignatureButtons: mapped " + jpgName + " -> " + pdfFile.getName());
-            } else {
-                Log.w(TAG, "injectExtraSignatureButtons: PDF not found for " + jpgName);
             }
         }
 
         if (pdfFiles.isEmpty()) {
-            Log.d(TAG, "injectExtraSignatureButtons: no valid PDF files found");
             return;
         }
 
@@ -6029,20 +5992,17 @@ thread.start();
                     "setButtonTheme", PresetSingleButton.class);
             setThemeMethod.setAccessible(true);
         } catch (NoSuchMethodException e) {
-            Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme method not found", e);
+            // setButtonTheme not available — buttons will use default theme
         }
 
         // Step 5: Set dialog's internal signature paths to match our ordering
-        // This ensures the dialog's internal state is consistent with our button layout
         List<String> orderedPaths = new ArrayList<>();
         for (File f : pdfFiles) {
             orderedPaths.add(f.getAbsolutePath());
         }
         selDialog.setSignatures(orderedPaths);
-        Log.d(TAG, "injectExtraSignatureButtons: called setSignatures with " + orderedPaths.size() + " paths");
 
         // Step 6: Override native buttons (index 0-1) with our consistent ordering
-        // Native setSignatures() may use a different order — we override to match mSignatureArrayUrl order
         PresetSingleButton[] nativeButtons = { firstSig, secondSig };
         for (int i = 0; i < Math.min(2, pdfFiles.size()); i++) {
             File pdfFile = pdfFiles.get(i);
@@ -6054,12 +6014,11 @@ thread.start();
                 try {
                     setThemeMethod.invoke(selDialog, button);
                 } catch (Exception e) {
-                    Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme failed for native button " + i, e);
+                    // Theme application failed — continue with default styling
                 }
             }
 
             // Cancel pending Picasso loads from native setSignatures() on BOTH internal ImageViews
-            // PresetSingleButton uses mPresetIcon OR mPresetIconWithBackground depending on theme
             try {
                 java.lang.reflect.Field iconField = PresetSingleButton.class.getDeclaredField("mPresetIcon");
                 iconField.setAccessible(true);
@@ -6070,48 +6029,31 @@ thread.start();
                 iconBgField.setAccessible(true);
                 android.widget.ImageView iconBgView = (android.widget.ImageView) iconBgField.get(button);
                 com.squareup.picasso.Picasso.get().cancelRequest(iconBgView);
-
-                Log.d(TAG, "injectExtraSignatureButtons: cancelled Picasso for native button " + i);
             } catch (Exception e) {
-                Log.w(TAG, "injectExtraSignatureButtons: failed to cancel Picasso for native button " + i, e);
+                // Picasso cancel failed — bitmap set below will still override
             }
 
             // Decode JPG and set bitmap directly — bypasses PDFTron's broken Skia decoder
             Bitmap previewBitmap = BitmapFactory.decodeFile(jpgFile.getAbsolutePath());
             if (previewBitmap != null) {
                 button.setPresetBitmap(previewBitmap);
-                Log.d(TAG, "injectExtraSignatureButtons: loaded bitmap " + previewBitmap.getWidth()
-                        + "x" + previewBitmap.getHeight() + " for native button " + i);
-            } else {
-                Log.w(TAG, "injectExtraSignatureButtons: failed to decode JPG for native button " + i
-                        + ": " + jpgFile.getAbsolutePath());
             }
 
-            // Set click listener: dismiss dialog, set signature file, let user tap to place
-            // This mirrors the original PR #4 flow: dismiss → sigTool.create(path, null) →
-            // tool stays in Signature mode → user taps document → stamp placed at tap point
+            // Set click listener: dismiss dialog, ensure target point, set signature file
             final String pdfPath = pdfFile.getAbsolutePath();
             button.setOnClickListener(v -> {
-                Log.d(TAG, "injectExtraSignatureButtons: native sig clicked: " + pdfPath);
                 selDialog.dismiss();
                 ToolManager tm2 = getToolManager();
                 if (tm2 != null && tm2.getTool() instanceof Signature) {
                     Signature sig = (Signature) tm2.getTool();
+                    ensureSignatureTargetPoint(sig);
                     sig.setSignatureFilePath(pdfPath);
-                    Log.d(TAG, "injectExtraSignatureButtons: signature file set, waiting for tap to place");
-                } else {
-                    Log.w(TAG, "injectExtraSignatureButtons: tool is not Signature at click time");
                 }
             });
-
-            Log.d(TAG, "injectExtraSignatureButtons: overrode native button " + i
-                    + " with " + pdfFile.getName());
         }
 
         // Step 7: Inject new buttons for index 2+ (no native buttons exist for these)
         if (pdfFiles.size() <= 2) {
-            Log.d(TAG, "injectExtraSignatureButtons: only " + pdfFiles.size()
-                    + " signatures — no extra buttons needed");
             return;
         }
 
@@ -6134,30 +6076,22 @@ thread.start();
             File pdfFile = pdfFiles.get(i);
             File jpgFile = matchedJpgFiles.get(i);
 
-            // Create a new PresetSingleButton
             PresetSingleButton newButton = new PresetSingleButton(context);
             newButton.setId(View.generateViewId());
 
-            // 1. Apply theme FIRST (sets empty state + colors)
+            // Apply theme (sets empty state + colors)
             if (setThemeMethod != null) {
                 try {
                     setThemeMethod.invoke(selDialog, newButton);
-                    Log.d(TAG, "injectExtraSignatureButtons: applied setButtonTheme to button " + i);
                 } catch (Exception themeEx) {
-                    Log.w(TAG, "injectExtraSignatureButtons: setButtonTheme failed for button " + i, themeEx);
                     newButton.setBackgroundColor(0);
                 }
             }
 
-            // 2. Decode JPG and set bitmap directly — bypasses PDFTron's broken Skia decoder
+            // Decode JPG and set bitmap directly
             Bitmap extraBitmap = BitmapFactory.decodeFile(jpgFile.getAbsolutePath());
             if (extraBitmap != null) {
                 newButton.setPresetBitmap(extraBitmap);
-                Log.d(TAG, "injectExtraSignatureButtons: loaded bitmap " + extraBitmap.getWidth()
-                        + "x" + extraBitmap.getHeight() + " for extra button " + i);
-            } else {
-                Log.w(TAG, "injectExtraSignatureButtons: failed to decode JPG for extra button " + i
-                        + ": " + jpgFile.getAbsolutePath());
             }
             newButton.setArrowIconVisible(false);
 
@@ -6171,18 +6105,15 @@ thread.start();
             lp.setMargins(margin16dp, margin4dp, margin16dp, 0);
             newButton.setLayoutParams(lp);
 
-            // Click listener: dismiss dialog, set signature file, let user tap to place
+            // Click listener: dismiss dialog, ensure target point, set signature file
             final String pdfPath = pdfFile.getAbsolutePath();
             newButton.setOnClickListener(v -> {
-                Log.d(TAG, "injectExtraSignatureButtons: extra sig clicked: " + pdfPath);
                 selDialog.dismiss();
                 ToolManager tm2 = getToolManager();
                 if (tm2 != null && tm2.getTool() instanceof Signature) {
                     Signature sig = (Signature) tm2.getTool();
+                    ensureSignatureTargetPoint(sig);
                     sig.setSignatureFilePath(pdfPath);
-                    Log.d(TAG, "injectExtraSignatureButtons: signature file set, waiting for tap to place");
-                } else {
-                    Log.w(TAG, "injectExtraSignatureButtons: tool is not Signature at click time");
                 }
             });
 
@@ -6190,8 +6121,6 @@ thread.start();
             newButtonIds.add(newButton.getId());
             previousViewId = newButton.getId();
             added++;
-            Log.d(TAG, "injectExtraSignatureButtons: added button " + i + " id=" + newButton.getId()
-                    + " file=" + pdfFile.getName());
         }
 
         // Step 8: Update the Barrier to include new buttons so Manage/Create shift down
@@ -6208,8 +6137,6 @@ thread.start();
                         newIds[oldIds.length + n] = newButtonIds.get(n);
                     }
                     barrier.setReferencedIds(newIds);
-                    Log.d(TAG, "injectExtraSignatureButtons: updated barrier with "
-                            + newIds.length + " referenced IDs");
                     break;
                 }
             }
@@ -6218,122 +6145,7 @@ thread.start();
         // Step 9: Hide the "+more" text since all signatures are now visible
         if (additionalSig != null) {
             additionalSig.setVisibility(View.GONE);
-            Log.d(TAG, "injectExtraSignatureButtons: hid mAdditionalSignature");
         }
-
-        Log.d(TAG, "injectExtraSignatureButtons: done — overrode 2 native + injected " + added + " extra buttons");
-    }
-
-    // Custom signature selection dialog that shows all 4 preloaded signatures
-    // This replaces PDFTron's built-in SignatureSelectionDialog which only shows 2 signatures
-    private void showCustomSignatureDialog(final Signature sigTool) {
-        Context context = getContext();
-        if (context == null) {
-            mShowingCustomSignatureDialog = false;
-            return;
-        }
-
-        // Get signature files from PDFTron's signature directory
-        File sigDir = new File(context.getFilesDir(), "signatures");
-        File jpgDir = new File(sigDir, "_pdftron_SignatureJPG");
-
-        Log.d(TAG, "Looking for signatures in: " + jpgDir.getAbsolutePath());
-
-        if (!jpgDir.exists() || !jpgDir.isDirectory()) {
-            Log.d(TAG, "No signature JPG directory found");
-            mShowingCustomSignatureDialog = false;
-            return;
-        }
-
-        // Get all JPG preview files
-        File[] jpgFiles = jpgDir.listFiles((dir, name) -> name.endsWith(".jpg"));
-        if (jpgFiles == null || jpgFiles.length == 0) {
-            Log.d(TAG, "No JPG signature files found");
-            mShowingCustomSignatureDialog = false;
-            return;
-        }
-
-        // Sort files by name to maintain consistent order
-        java.util.Arrays.sort(jpgFiles, (a, b) -> a.getName().compareTo(b.getName()));
-
-        Log.d(TAG, "Found " + jpgFiles.length + " signature files");
-
-        // Create dialog
-        android.app.AlertDialog.Builder builder = new android.app.AlertDialog.Builder(context);
-        builder.setTitle("Select Signature");
-
-        // Create a horizontal scroll view with signature images
-        android.widget.HorizontalScrollView scrollView = new android.widget.HorizontalScrollView(context);
-        android.widget.LinearLayout layout = new android.widget.LinearLayout(context);
-        layout.setOrientation(android.widget.LinearLayout.HORIZONTAL);
-        layout.setPadding(16, 16, 16, 16);
-
-        final android.app.AlertDialog[] dialogRef = new android.app.AlertDialog[1];
-
-        for (File jpgFile : jpgFiles) {
-            // Create image view for each signature
-            android.widget.ImageView imageView = new android.widget.ImageView(context);
-            Bitmap bitmap = BitmapFactory.decodeFile(jpgFile.getAbsolutePath());
-            if (bitmap != null) {
-                imageView.setImageBitmap(bitmap);
-                imageView.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
-
-                // Set size
-                android.widget.LinearLayout.LayoutParams params = new android.widget.LinearLayout.LayoutParams(
-                        300, 200);
-                params.setMargins(8, 8, 8, 8);
-                imageView.setLayoutParams(params);
-
-                // Add border
-                imageView.setBackgroundResource(android.R.drawable.dialog_holo_light_frame);
-                imageView.setPadding(8, 8, 8, 8);
-
-                // Get corresponding PDF file
-                String jpgName = jpgFile.getName();
-                String pdfName = jpgName.replace(".jpg", ".pdf");
-                File pdfFile = new File(sigDir, pdfName);
-
-                Log.d(TAG, "Signature: " + jpgName + " -> PDF: " + pdfFile.getAbsolutePath() + " exists: " + pdfFile.exists());
-
-                if (pdfFile.exists()) {
-                    final String pdfPath = pdfFile.getAbsolutePath();
-                    imageView.setOnClickListener(v -> {
-                        Log.d(TAG, "Signature selected: " + pdfPath);
-                        if (dialogRef[0] != null) {
-                            dialogRef[0].dismiss();
-                        }
-                        // Apply the signature using the Signature tool
-                        if (sigTool != null) {
-                            sigTool.create(pdfPath, null);
-                        } else {
-                            // Fallback: create a new Signature tool
-                            ToolManager tm = getToolManager();
-                            if (tm != null) {
-                                Signature newSigTool = (Signature) tm.createTool(ToolManager.ToolMode.SIGNATURE, null);
-                                tm.setTool(newSigTool);
-                                newSigTool.create(pdfPath, null);
-                            }
-                        }
-                        mShowingCustomSignatureDialog = false;
-                    });
-                }
-
-                layout.addView(imageView);
-            }
-        }
-
-        scrollView.addView(layout);
-        builder.setView(scrollView);
-        builder.setNegativeButton("Cancel", (dialog, which) -> {
-            dialog.dismiss();
-            mShowingCustomSignatureDialog = false;
-        });
-        builder.setOnDismissListener(dialog -> {
-            mShowingCustomSignatureDialog = false;
-        });
-
-        dialogRef[0] = builder.create();
-        dialogRef[0].show();
     }
 
     // Helper method to hide create options (Draw, Type, Image tabs) in SignatureDialogFragment
