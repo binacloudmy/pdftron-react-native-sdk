@@ -3549,10 +3549,15 @@ thread.start();
         Log.d(TAG, "SignatureDialogFragment.MAX_SIGNATURES = " + SignatureDialogFragment.MAX_SIGNATURES);
 
         // Also get the Activity's FragmentManager to register callbacks there
+        // React Native wraps the Activity in ContextWrapper, so unwrap to find it
         FragmentManager activityFM = null;
-        if (getContext() instanceof AppCompatActivity) {
-            activityFM = ((AppCompatActivity) getContext()).getSupportFragmentManager();
-            Log.d(TAG, "Got Activity FragmentManager");
+        android.content.Context ctx = getContext();
+        while (ctx instanceof android.content.ContextWrapper) {
+            if (ctx instanceof AppCompatActivity) {
+                activityFM = ((AppCompatActivity) ctx).getSupportFragmentManager();
+                break;
+            }
+            ctx = ((android.content.ContextWrapper) ctx).getBaseContext();
         }
 
         // Register fragment lifecycle callback on BOTH managers
@@ -5815,9 +5820,12 @@ thread.start();
         private String convertReadableArrayToString(ReadableArray readableArray) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < readableArray.size(); i++) {
-            sb.append(readableArray.getString(i));
+            // Strip query parameters from URLs so presigned URL changes don't trigger unnecessary reloads
+            String url = readableArray.getString(i);
+            int queryIndex = url.indexOf('?');
+            sb.append(queryIndex > 0 ? url.substring(0, queryIndex) : url);
             if (i < readableArray.size() - 1) {
-                sb.append(","); // Separator for each URL
+                sb.append(",");
             }
         }
         return sb.toString();
@@ -5828,12 +5836,14 @@ thread.start();
         SharedPreferences sharedPreferences = context.getSharedPreferences(APP_PREFERNCES, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sharedPreferences.edit();
 
-        // Convert mSignatureArrayUrl (ReadableArray) to a comma-separated string
+        // Convert mSignatureArrayUrl to a comma-separated string (strip query params for stable comparison)
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < mSignatureArrayUrl.size(); i++) {
-            sb.append(mSignatureArrayUrl.getString(i));
+            String url = mSignatureArrayUrl.getString(i);
+            int queryIndex = url.indexOf('?');
+            sb.append(queryIndex > 0 ? url.substring(0, queryIndex) : url);
             if (i < mSignatureArrayUrl.size() - 1) {
-                sb.append(","); // Separator for each URL
+                sb.append(",");
             }
         }
         String currentSignatureUrls = sb.toString();
