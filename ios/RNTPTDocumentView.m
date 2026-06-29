@@ -32,15 +32,17 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     
-    UIViewController *parentViewController = self.parentViewController;
-     
-     // Log the parent view controller class name
-//     NSLog(@"Parent View Controller: %@", NSStringFromClass([parentViewController class]));
-     
-     // Check if there's a parent and log its view hierarchy
-     if (parentViewController) {
-         [self hideAndDisableButtons:parentViewController.view];
-     }
+    // Signatures are managed on web — remove the add/edit bar buttons here (use-only).
+    // iOS 26: "New Signature" is a bar-button in the bottom floating toolbar; "Edit" is a nav-bar item.
+    // Clear them at the bar level (hiding the views leaves empty glass pills). Keep the left close (X).
+    void (^stripBars)(void) = ^{
+        self.toolbarItems = @[];
+        [self.navigationController setToolbarHidden:YES animated:NO];
+        self.navigationItem.rightBarButtonItems = @[];
+    };
+    stripBars();
+    // Re-apply after layout in case Apryse sets the bars slightly later.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), stripBars);
 }
 
 - (void)viewDidLoad {
@@ -72,26 +74,18 @@ NS_ASSUME_NONNULL_BEGIN
         
 //        if ([subview isKindOfClass:[UIButton class]]) {
 //            UIButton *button = (UIButton *)subview;
-//            // Try to find a UILabel inside the UIButton to get the text
 //            NSString *buttonLabel = [self findLabelInButton:button];
 //            if (buttonLabel) {
-//                NSLog(@"Button Label: %@", buttonLabel);
-//                
-//                // Check the label text to hide or disable specific buttons
 //                if ([buttonLabel isEqualToString:@"Create New Signature"]  ||
-//                    [buttonLabel isEqualToString:@"Done"] ||
 //                    [buttonLabel isEqualToString:@"Edit"] ||
 //                    [buttonLabel isEqualToString:@"New Signature"]
 //                    ) {
-//                    subview.hidden = YES;  // Hide the button
-//                    subview.userInteractionEnabled = NO;
-//                    button.hidden = YES;  // Hide the button
-//                    button.enabled = NO;  // Disable the button
+//                    subview.hidden = YES;
+//                    button.hidden = YES;
+//                    button.enabled = NO;
 //                    button.userInteractionEnabled = NO;
 //                }
 //            }
-//        }else{
-//            NSLog(@"Parent View Controller: %@", NSStringFromClass([subview class]));
 //        }
         
         // Recursively call this method for all subviews
@@ -2178,8 +2172,7 @@ NS_ASSUME_NONNULL_END
 
 - (BOOL)savedSignaturesControllerShouldHideCreateNewSignatureButton:(nonnull PTSavedSignaturesViewController *)savedSignaturesController
 {
-    NSLog(@"123 shouldCreateNewSignature called");  
-    return NO;
+    return self.hideCreateNewSignatureButton;
 }
 
 
